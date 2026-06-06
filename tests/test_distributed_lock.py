@@ -180,6 +180,11 @@ def test_nested_with_counts_and_release_once():
 
 def test_concurrent_acquire_different_clients():
     """Thread A on port 2381, Thread B on port 2379 — same cluster, one lock."""
+    try:
+        etcd3.client(host="127.0.0.1", port=2379).status()
+    except Exception:
+        pytest.skip("port 2379 not reachable — requires Docker 3-node cluster")
+
     _original_client = distributed_lock.client
     results = []
 
