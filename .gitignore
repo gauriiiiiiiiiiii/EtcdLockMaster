@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+distributed_lock.log
+.history/
+distributed-lock-etcd-main/
+etcd/
+etcd-data/

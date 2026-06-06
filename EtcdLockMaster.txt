@@ -1,0 +1,368 @@
+==============================================================================
+  ETCDLOCKMASTER — COMPLETE PROJECT EXPLANATION
+==============================================================================
+
+WHAT THIS PROJECT IS
+----------------------
+A distributed locking library written in Python, built on top of etcd — a
+distributed key-value store. The lock lets multiple processes or machines
+coordinate access to a shared resource: only ONE holder can own the lock at
+a time. When that holder finishes (or crashes), the lock is automatically
+freed and the next waiter can take it.
+
+Real-world uses:
+  - Prevent two services from running a database migration at the same time
+  - Ensure only one scheduler pod triggers a cron job in a Kubernetes cluster
+  - Serialize access to a third-party API that has rate limits
+  - Leader election in a microservices cluster
+
+
+==============================================================================
+  FOLDER STRUCTURE
+==============================================================================
+
+EtcdLockMaster/
+│
+├── distributed_lock.py          ← MAIN LIBRARY (all the lock logic lives here)
+│
+├── tests/
+│   ├── __init__.py              ← Makes tests/ a Python package
+│   └── test_distributed_lock.py ← 12 automated tests
+│
+├── etcd/
+│   └── etcd-v3.5.10-windows-amd64/
+│       ├── etcd.exe             ← etcd server binary (Windows)
+│       ├── etcdctl.exe          ← command-line client to inspect the cluster
+│       └── etcdutl.exe          ← utility for offline etcd data operations
+│
+├── etcd-data/                   ← etcd's on-disk storage (auto-managed)
+│   ├── node1/                   ← Data for etcd node 1 (port 2379)
+│   ├── node2/                   ← Data for etcd node 2 (port 2381)
+│   ├── etcd1.log                ← Runtime log for node 1
+│   └── etcd2.log                ← Runtime log for node 2
+│
+├── venv/                        ← Python virtual environment (dependencies)
+│
+├── docker-compose.yml           ← Alternative: spin up a 3-node etcd cluster
+│                                   via Docker instead of local binaries
+├── requirements.txt             ← Python packages needed (etcd3, grpcio, etc.)
+├── pytest.ini                   ← pytest configuration
+└── .gitignore                   ← Files git should not track
+
+
+==============================================================================
+  WHAT ETCD IS AND WHY WE USE IT
+==============================================================================
+
+etcd is a distributed key-value database that:
+  1. Uses the Raft consensus algorithm — a majority of nodes must agree before
+     any write is committed. This makes it strongly consistent: all reads see
+     the latest confirmed write, no matter which node you ask.
+  2. Supports LEASES — a key can be attached to a time-limited lease (TTL).
+     If the lease expires (because the client died), etcd automatically deletes
+     the key. This is how our lock auto-cleans itself after a crash.
+  3. Supports ATOMIC TRANSACTIONS — "put this key only if it does not exist
+     yet." This is how we guarantee only one client can grab the lock.
+  4. Supports WATCHES — a client can subscribe to changes on a key and be
+     notified instantly when the key is deleted. This is how waiting clients
+     know the lock was released without polling.
+
+We run a 2-node cluster:
+  - Node 1: localhost:2379 (peer port 2380)
+  - Node 2: localhost:2381 (peer port 2382) ← the app connects here by default
+
+Both nodes form one Raft cluster: a write to node 1 is visible on node 2 and
+vice versa. This is how "multi-client exclusivity" works — two Python processes
+pointing at different nodes still share the same lock state.
+
+
+==============================================================================
+  HOW THE LOCK WORKS — STEP BY STEP
+==============================================================================
+
+ACQUIRING A LOCK
+-----------------
+1. Client creates a LEASE with a TTL (e.g. 30 seconds). The lease is a
+   time-bomb: if the client does nothing, etcd will delete all keys tied to
+   this lease after TTL seconds.
+
+2. Client runs an ATOMIC TRANSACTION:
+     IF the lock key "/locks/<resource>" does NOT exist (create revision == 0)
+     THEN write the key with value = a unique owner-ID (UUID4), attached to
+          the new lease
+     ELSE do nothing
+
+3. If the transaction SUCCEEDS → we own the lock. Return (owner_id, lease).
+
+4. If the transaction FAILS (someone else holds the lock):
+     a. Revoke the unused lease we just created (clean up immediately).
+     b. SET UP A WATCH on the lock key.
+     c. Check if the key was already deleted between step 2 and step 4b
+        (a race window). If it's already gone, loop back to step 1.
+     d. Otherwise BLOCK until the watch fires a DeleteEvent (the holder
+        released or crashed) or until the timeout expires.
+     e. When the DeleteEvent arrives, loop back to step 1 and try again.
+
+RELEASING A LOCK
+-----------------
+1. Verify we still own the key (our owner UUID matches the stored value).
+2. REVOKE the lease. When the lease is revoked, etcd atomically deletes the
+   key. Any watchers (waiting clients) are immediately notified.
+
+AUTO-RENEWAL (optional)
+------------------------
+If the work inside the lock takes longer than the TTL, the lease would expire
+and the lock would disappear. The auto_renew=True option starts a background
+daemon thread that calls lease.refresh() every TTL/2 seconds, resetting the
+countdown. The thread stops and cleans up the moment __exit__ is called.
+
+RE-ENTRANCY
+-----------
+The DistributedLock class keeps an internal counter (_count). If the same
+Python object tries to acquire a lock it already holds (nested "with" blocks),
+we just increment the counter — no network call, no block. On exit, we
+decrement; only when it reaches 0 do we actually release.
+
+
+==============================================================================
+  THE LIBRARY API (distributed_lock.py)
+==============================================================================
+
+LOW-LEVEL FUNCTIONS
+--------------------
+
+  acquire_lock(resource, ttl=30, timeout=None)
+    - resource : string name for the lock (e.g. "db-migration")
+    - ttl      : seconds before lease auto-expires if not renewed
+    - timeout  : max seconds to wait for the lock (None = wait forever)
+    Returns (owner_id, lease) on success.
+    Raises TimeoutError if timeout is exceeded.
+
+  release_lock(resource, owner, lease)
+    - Only releases if our owner UUID matches what's stored.
+    - Raises RuntimeError on ownership mismatch (safety guard).
+
+CONTEXT MANAGER (recommended)
+-------------------------------
+
+  DistributedLock(resource, ttl=30, timeout=None, auto_renew=False)
+
+    Usage:
+        try:
+            with DistributedLock("job42", ttl=30, timeout=10, auto_renew=True) as lock:
+                # --- critical section ---
+                print("I have the lock:", lock.owner)
+                if not lock.is_locked:
+                    raise RuntimeError("Lost the lock!")
+        except TimeoutError:
+            print("Could not acquire the lock in time")
+
+    Properties:
+        lock.owner     → the UUID string that identifies this lock holder
+        lock.is_locked → True if the key still exists in etcd with our UUID
+
+HELPER FUNCTIONS (internal, but documented here for understanding)
+-------------------------------------------------------------------
+
+  safe_revoke(lease)
+    Revokes a lease and silently ignores "lease not found" errors (the lease
+    may have already expired naturally).
+
+  _wait_for_deletion(key, wait_time)
+    Starts a watch on `key`, then immediately checks if the key is already
+    gone (race-condition safe). Blocks until a DeleteEvent arrives or
+    wait_time seconds pass. Returns True if deletion was observed.
+
+
+==============================================================================
+  BUGS FIXED FROM THE ORIGINAL CODE
+==============================================================================
+
+BUG 1 — None-timeout caused immediate timeout
+  Original code:
+      remaining = (timeout - elapsed) if timeout is not None else None
+      saw_delete = _wait_for_deletion(key, remaining or 0)   ← WRONG
+
+  Problem: When timeout=None (wait forever), `remaining` is None.
+           `None or 0` evaluates to 0, so _wait_for_deletion was called with
+           wait_time=0, which returned immediately → TimeoutError raised even
+           though the user asked to wait forever.
+
+  Fix: Pass `remaining` directly (None means infinite). Handle None and <= 0
+       as separate cases inside _wait_for_deletion.
+
+BUG 2 — Race window between transaction failure and watch setup
+  Original code set up the watch AFTER the failed transaction, then blocked.
+  Problem: The lock holder could release (or its lease expire) in the tiny gap
+           between the transaction failure and the watch starting. The watch
+           would then see no events and time out even though the key was gone.
+
+  Fix: After starting the watch, do a GET on the key. If it's already gone,
+       cancel the watch and return True immediately. This closes the race window.
+
+BUG 3 — Monkey-patching test left module client in wrong state
+  The test_concurrent_acquire_different_clients test patches
+  distributed_lock.client inside threads, leaving it pointing to the wrong
+  port after the test finishes. The teardown fixture then failed because it
+  couldn't connect.
+
+  Fix: Save and restore distributed_lock.client around the test.
+
+
+==============================================================================
+  THE TEST SUITE (tests/test_distributed_lock.py)
+==============================================================================
+
+12 tests, all must pass. Run with:  ./venv/Scripts/python -m pytest -v
+
+test_basic_acquire_release
+  Acquires a lock, checks the key exists in etcd, releases it, checks it's gone.
+
+test_lease_expiry_allows_reacquire
+  Acquires with TTL=1s, sleeps 2s (lease expires naturally), then a second
+  client acquires — proves the lease auto-cleanup works.
+
+test_reentrant_behavior
+  Same DistributedLock instance enters a nested "with lock:" block. Verifies
+  the owner stays the same and the lock isn't double-released.
+
+test_auto_renew_holds_longer_than_ttl
+  TTL=1s but auto_renew=True. Sleeps 3 seconds. Verifies the key still exists
+  (the background thread kept refreshing it).
+
+test_concurrent_acquire_times_out_one_and_succeeds_other
+  Two threads race for the same lock. Thread 1 holds it for 2s, Thread 2 only
+  waits 1s. Thread 2 must TimeoutError; Thread 1 must succeed.
+
+test_lock_is_locked
+  Verifies is_locked is True inside the with block and False after exit.
+
+test_exclusive_acquire_direct
+  Direct acquire_lock calls: first succeeds, second TimeoutErrors, after
+  release a third succeeds.
+
+test_exclusive_acquire_indirect
+  Same as above but the second attempt uses the DistributedLock context manager.
+
+test_exclusive_acquire_context_manager
+  Two DistributedLock instances compete; proves the context manager enforces
+  exclusivity correctly.
+
+test_ttl_expiry_detected_inside_block
+  No auto_renew. Inside the with block, sleep past TTL. Confirms is_locked
+  becomes False once the lease expires on the server.
+
+test_nested_with_counts_and_release_once
+  Nests three levels of "with lock:". Checks the internal _count increments
+  and decrements correctly and the key disappears only after the outermost exit.
+
+test_concurrent_acquire_different_clients
+  Thread A connects to port 2381 (etcd node 2), Thread B connects to port 2379
+  (etcd node 1). Both try to grab the same lock. Proves that locks are
+  cluster-wide: A holds it, B times out, even though they talk to different
+  nodes.
+
+
+==============================================================================
+  HOW TO RUN EVERYTHING FROM SCRATCH
+==============================================================================
+
+STEP 1 — Start the 2-node etcd cluster (Windows, no Docker needed)
+
+  ETCD=etcd/etcd-v3.5.10-windows-amd64/etcd.exe
+  CLUSTER="etcd1=http://127.0.0.1:2380,etcd2=http://127.0.0.1:2382"
+  rm -rf etcd-data/node1 etcd-data/node2
+  mkdir -p etcd-data/node1 etcd-data/node2
+
+  $ETCD --name=etcd1 --data-dir=etcd-data/node1 \
+        --listen-client-urls=http://127.0.0.1:2379 \
+        --advertise-client-urls=http://127.0.0.1:2379 \
+        --listen-peer-urls=http://127.0.0.1:2380 \
+        --initial-advertise-peer-urls=http://127.0.0.1:2380 \
+        --initial-cluster=$CLUSTER --initial-cluster-state=new \
+        >> etcd-data/etcd1.log 2>&1 &
+
+  $ETCD --name=etcd2 --data-dir=etcd-data/node2 \
+        --listen-client-urls=http://127.0.0.1:2381 \
+        --advertise-client-urls=http://127.0.0.1:2381 \
+        --listen-peer-urls=http://127.0.0.1:2382 \
+        --initial-advertise-peer-urls=http://127.0.0.1:2382 \
+        --initial-cluster=$CLUSTER --initial-cluster-state=new \
+        >> etcd-data/etcd2.log 2>&1 &
+
+  # Verify both nodes are up
+  etcd/etcd-v3.5.10-windows-amd64/etcdctl.exe \
+      --endpoints=http://127.0.0.1:2379,http://127.0.0.1:2381 \
+      endpoint health
+
+  Alternative (if Docker Desktop is installed):
+      docker compose up -d
+
+STEP 2 — Set up Python environment (only needed once)
+
+  python -m venv venv
+  ./venv/Scripts/pip install -r requirements.txt
+
+STEP 3 — Run the demo
+
+  ./venv/Scripts/python distributed_lock.py
+
+  You will see 4 demos:
+    1. Basic acquire and release
+    2. Re-entrant nested acquire (same instance, no block)
+    3. Auto-renew: holds the lock for 7 seconds with a 3s TTL
+    4. is_locked property check
+
+STEP 4 — Run all tests
+
+  ./venv/Scripts/python -m pytest -v
+
+  Expected: 12 passed
+
+
+==============================================================================
+  DEPENDENCIES (requirements.txt)
+==============================================================================
+
+  etcd3==0.12.0          Python client library for etcd v3
+  grpcio==1.62.3         gRPC transport (etcd communicates over gRPC)
+  protobuf==3.20.3       Protocol Buffers serialization (must be 3.x, not 4.x,
+                         because etcd3's generated proto code is outdated)
+  pytest==8.3.5          Test runner
+
+
+==============================================================================
+  DESIGN DECISIONS
+==============================================================================
+
+1. LEASE-BASED AUTO-CLEANUP
+   Every lock key is tied to a lease. If the process holding the lock crashes
+   or is killed, the lease expires and etcd deletes the key automatically.
+   No external cleanup job or heartbeat table needed.
+
+2. ATOMIC COMPARE-AND-SWAP
+   "Put key only if it doesn't exist" is a single etcd transaction, not a
+   read-then-write. This is safe under concurrent clients.
+
+3. WATCH INSTEAD OF POLLING
+   Waiting clients subscribe to the key via a watch, so they are notified
+   immediately when the lock is released. No CPU-burning polling loop.
+
+4. WATCH + EXISTENCE CHECK (race-safe)
+   We start the watch first, THEN check if the key is already gone. This
+   avoids a race where the key disappears between the failed transaction and
+   the watch being set up.
+
+5. SELECTIVE AUTO-RENEWAL
+   Short tasks don't need renewal. The background thread only starts when
+   auto_renew=True, keeping overhead low for the common case.
+
+6. DUAL API
+   Low-level: acquire_lock / release_lock for scripts that need fine control.
+   High-level: DistributedLock context manager for clean "with" blocks.
+
+7. MODULE-LEVEL CLIENT
+   The etcd client is a module-level variable. This lets tests monkey-patch it
+   to simulate multi-client scenarios without changing the library's API.
+
+==============================================================================
