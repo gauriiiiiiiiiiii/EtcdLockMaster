@@ -6,7 +6,6 @@ import etcd3
 from distributed_lock import acquire_lock, release_lock, DistributedLock
 import distributed_lock
 
-# Uses the same etcd instance as the main module (host=127.0.0.1, port=2381)
 client = etcd3.client(host="127.0.0.1", port=2381)
 
 
@@ -17,10 +16,6 @@ def etcd_cleanup():
     client.delete_prefix("/locks/")
 
 
-# ---------------------------------------------------------------------------
-# Basic acquire / release
-# ---------------------------------------------------------------------------
-
 def test_basic_acquire_release():
     owner, lease = acquire_lock("test1", ttl=5, timeout=1)
     val, _ = client.get("/locks/test1")
@@ -30,34 +25,22 @@ def test_basic_acquire_release():
     assert val is None
 
 
-# ---------------------------------------------------------------------------
-# Lease expiry
-# ---------------------------------------------------------------------------
-
 def test_lease_expiry_allows_reacquire():
     owner1, lease1 = acquire_lock("test2", ttl=1, timeout=1)
-    time.sleep(2)  # let the lease expire naturally
+    time.sleep(2)  # let lease expire naturally
     owner2, lease2 = acquire_lock("test2", ttl=1, timeout=1)
     assert owner2 != owner1
     release_lock("test2", owner2, lease2)
 
 
-# ---------------------------------------------------------------------------
-# Re-entrancy
-# ---------------------------------------------------------------------------
-
 def test_reentrant_behavior():
     with DistributedLock("test3", ttl=5, timeout=1) as lock:
         first_owner = lock.owner
-        with lock:  # nested re-entry — same owner, no block
+        with lock:  # re-entry — same owner, no block
             assert lock.owner == first_owner
     val, _ = client.get("/locks/test3")
     assert val is None
 
-
-# ---------------------------------------------------------------------------
-# Auto-renew keeps the lock alive past its TTL
-# ---------------------------------------------------------------------------
 
 def test_auto_renew_holds_longer_than_ttl():
     t0 = time.time()
@@ -69,10 +52,6 @@ def test_auto_renew_holds_longer_than_ttl():
     assert val is None
     assert time.time() - t0 >= 3
 
-
-# ---------------------------------------------------------------------------
-# Concurrent acquisition: one succeeds, one times out
-# ---------------------------------------------------------------------------
 
 def test_concurrent_acquire_times_out_one_and_succeeds_other():
     results = []
@@ -97,19 +76,11 @@ def test_concurrent_acquire_times_out_one_and_succeeds_other():
     assert ("t2", "timeout") in [(r[0], r[1]) for r in results]
 
 
-# ---------------------------------------------------------------------------
-# is_locked property
-# ---------------------------------------------------------------------------
-
 def test_lock_is_locked():
     with DistributedLock("test6", ttl=5, timeout=1) as lock:
         assert lock.is_locked
     assert not lock.is_locked
 
-
-# ---------------------------------------------------------------------------
-# Exclusivity — direct function calls
-# ---------------------------------------------------------------------------
 
 def test_exclusive_acquire_direct():
     owner1, lease1 = acquire_lock("exclusive", ttl=5, timeout=1)
@@ -146,20 +117,12 @@ def test_exclusive_acquire_context_manager():
         assert l2.is_locked
 
 
-# ---------------------------------------------------------------------------
-# TTL expiry detected inside the with block (no auto-renew)
-# ---------------------------------------------------------------------------
-
 def test_ttl_expiry_detected_inside_block():
     with DistributedLock("shortlived", ttl=1, timeout=1, auto_renew=False) as lock:
         assert lock.is_locked
         time.sleep(3)
         assert not lock.is_locked  # lease expired on the server
 
-
-# ---------------------------------------------------------------------------
-# Nested with counts: only one release on exit
-# ---------------------------------------------------------------------------
 
 def test_nested_with_counts_and_release_once():
     lock = DistributedLock("nested", ttl=3, timeout=1, auto_renew=False)
@@ -174,10 +137,6 @@ def test_nested_with_counts_and_release_once():
     assert val is None
 
 
-# ---------------------------------------------------------------------------
-# Multi-client exclusivity: two different etcd client connections
-# ---------------------------------------------------------------------------
-
 def test_concurrent_acquire_different_clients():
     """Thread A on port 2381, Thread B on port 2379 — same cluster, one lock."""
     try:
@@ -191,9 +150,7 @@ def test_concurrent_acquire_different_clients():
     def worker(name, port, hold_time, timeout):
         distributed_lock.client = etcd3.client(host="127.0.0.1", port=port)
         try:
-            with distributed_lock.DistributedLock(
-                "shared", ttl=5, timeout=timeout, auto_renew=False
-            ) as lock:
+            with distributed_lock.DistributedLock("shared", ttl=5, timeout=timeout, auto_renew=False) as lock:
                 results.append((name, "acquired", port))
                 time.sleep(hold_time)
         except TimeoutError:
@@ -207,8 +164,7 @@ def test_concurrent_acquire_different_clients():
     tA.join()
     tB.join()
 
-    # Restore the original client so teardown fixtures work correctly
-    distributed_lock.client = _original_client
+    distributed_lock.client = _original_client  # restore so cleanup fixture works
 
     assert ("A", "acquired", 2381) in results
     assert ("B", "timeout", 2379) in results
